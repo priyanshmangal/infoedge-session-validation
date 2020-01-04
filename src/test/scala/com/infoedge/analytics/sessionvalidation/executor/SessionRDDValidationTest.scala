@@ -6,30 +6,15 @@ import com.infoedge.analytics.sessionvalidation.configuration.SessionValidationG
 import com.infoedge.analytics.sessionvalidation.utility.sharedcontext.SharedSparkContext
 import com.typesafe.config.ConfigFactory
 import org.apache.spark.sql.Row
-import org.apache.spark.sql.types._
+import org.apache.spark.sql.types.{BooleanType, LongType, StringType, StructField, StructType, TimestampType}
 import org.scalatest.FunSuite
 
-
-class SessionValidationJobTest extends FunSuite with SharedSparkContext {
-
+class SessionRDDValidationTest extends FunSuite  with SharedSparkContext {
 
   val applicationConfig = ConfigFactory.parseResources("analytics.conf")
   val sessionValidationGlobalConfiguration = new SessionValidationGlobalConfiguration(applicationConfig)
 
-  test("SessionValidationJobTest - Jun Job") {
-
-    SessionValidationJob(sessionValidationGlobalConfiguration).runJob(sqlContext)
-
-  }
-
-  test("SessionValidationJobTest - execute") {
-
-    SessionValidationJob(sessionValidationGlobalConfiguration).execute(sqlContext)
-
-  }
-
-
-  test("SessionValidationJobTest - validate session and analysis") {
+  test("SessionRDDValidationTest - validate session and analysis") {
 
     val rowList = Seq(
       Row("aa", 1L, Timestamp.valueOf("2020-01-04 10:30:00")),
@@ -56,8 +41,8 @@ class SessionValidationJobTest extends FunSuite with SharedSparkContext {
     val rdd = sc.parallelize(rowList)
     val df = sqlContext.createDataFrame(rdd, rowSchema)
 
-    val resultDF = SessionValidationJob(sessionValidationGlobalConfiguration).getSessionAnalysisDF(df)
-    val actualDF =  resultDF.select("e_session_id", "e_visitor_id", "e_time", "intended_session_id", "valid_session")
+    val resultDF = SessionRDDValidation(sessionValidationGlobalConfiguration).getSessionAnalysisDF(df, sqlContext)
+    val actualDF =  resultDF
     actualDF.printSchema()
     actualDF.show()
 
@@ -89,29 +74,35 @@ class SessionValidationJobTest extends FunSuite with SharedSparkContext {
     assert(actualDF.schema === expectedDF.schema)
     assert(actualDF.except(expectedDF).count == 0)
     assert(expectedDF.except(actualDF).count == 0)
+
   }
 
-  test("test - analysis") {
+
+  test("assert between rdd level validation and dataframe level validation") {
     val readDF = sqlContext.read.format("com.databricks.spark.csv")
       .option("header", "true")
       .option("inferSchema", true)
       .load("/Users/priyanshmangal/Documents/Personal-projects/data/input/")
-    readDF.printSchema()
-    readDF.show(false)
-    val sessionValidation = SessionValidationJob(sessionValidationGlobalConfiguration)
-    val analysisSessionDF = sessionValidation.getSessionAnalysisDF(readDF).cache()
+    val actualDF = readDF.filter(readDF("e_visitor_id") === 667366160187382810L)
+    actualDF.printSchema()
+    actualDF.show(false)
+    val sessionDFValidation = SessionValidationJob(sessionValidationGlobalConfiguration)
+    val analysisSessionDF = sessionDFValidation.getSessionAnalysisDF(actualDF).cache()
+    val uniqueAnomalyVisitorDF = sessionDFValidation.getUniqueAnomalyVisitor(analysisSessionDF)
+    val anomalyExtraSessionDF = sessionDFValidation.getAnomalyExtraSession(analysisSessionDF)
+    val updatedIntendedSessionIdDF = sessionDFValidation.getUpdatedSessionDFWithIntendedSessionId(analysisSessionDF)
+     analysisSessionDF.show(100, false)
 
-    //    println(analysisSessionDF.filter(analysisSessionDF("final_validation")===false).count())
-    //    println(analysisSessionDF.filter(analysisSessionDF("valid_session")===false).count())
-    //
-    //    analysisSessionDF.filter(analysisSessionDF("final_validation")===false &&
-    //      analysisSessionDF("valid_session")===true).show(false)
+    val sessionRDDValidation = SessionRDDValidation(sessionValidationGlobalConfiguration)
+    val analysisRDDSessionDF = sessionRDDValidation.getSessionAnalysisDF(actualDF, sqlContext).cache()
+    val uniqueRDDAnomalyVisitorDF = sessionDFValidation.getUniqueAnomalyVisitor(analysisRDDSessionDF).cache()
+    val anomalyRDDExtraSessionDF = sessionDFValidation.getAnomalyExtraSession(analysisRDDSessionDF)
+    val updatedRDDIntendedSessionIdDF = sessionDFValidation.getUpdatedSessionDFWithIntendedSessionId(analysisRDDSessionDF)
 
-    val uniqueAnomalyVisitorDF = sessionValidation.getUniqueAnomalyVisitor(analysisSessionDF)
-    val anomalyExtraSessionDF = sessionValidation.getAnomalyExtraSession(analysisSessionDF)
-    val updatedIntendedSessionIdDF = sessionValidation.getUpdatedSessionDFWithIntendedSessionId(analysisSessionDF)
+     analysisRDDSessionDF.show(100, false)
+//    uniqueAnomalyVisitorDF.except(uniqueRDDAnomalyVisitorDF).show(false)
+//    uniqueRDDAnomalyVisitorDF.except(uniqueAnomalyVisitorDF).show(false)
+//    assert(uniqueAnomalyVisitorDF.except(uniqueRDDAnomalyVisitorDF).count == 0)
 
-     println(uniqueAnomalyVisitorDF.count())
-    updatedIntendedSessionIdDF.show(50, false)
   }
 }

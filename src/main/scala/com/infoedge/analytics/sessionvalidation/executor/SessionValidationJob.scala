@@ -1,10 +1,14 @@
 package com.infoedge.analytics.sessionvalidation.executor
 
+import java.sql.Timestamp
+
 import com.infoedge.analytics.sessionvalidation.configuration.SessionValidationGlobalConfiguration
-import org.apache.spark.sql.expressions.Window
+import org.apache.spark.sql.expressions.{UserDefinedFunction, Window}
 import org.apache.spark.sql.functions._
+import org.apache.spark.sql.types.LongType
 import org.apache.spark.sql.{DataFrame, SQLContext, SaveMode}
 import org.apache.spark.storage.StorageLevel
+import org.joda.time.DateTime
 import org.slf4j.{Logger, LoggerFactory}
 
 
@@ -46,21 +50,36 @@ class SessionValidationJob(sessionValidationGlobalConfiguration: SessionValidati
     writeOutputDataFrame(anomalyExtraSessionDF, outputFilePath+ "/anomalyExtraSessionDF")
     writeOutputDataFrame(updatedIntendedSessionIdDF, outputFilePath+ "/updatedIntendedSessionIdDF")
 
+    logger.info("Spark Job End Time -" + System.currentTimeMillis())
   }
 
-  /** getSessionDebugDF
+
+  /**
+   *  udf to get minutes between two timestamp
+   */
+  val validate: UserDefinedFunction = udf { (first: Timestamp, second: Timestamp ) =>
+      val timeDiff = (new DateTime(first).getMillis - new DateTime(second).getMillis) / (60 * 1000.0)
+      timeDiff
+  }
+
+  /** getSessionAnalysisDF
+   * Identify all sessions which are invalide for criterion:
+   * There should be at least 30 minutes difference in any two sessions by any visitor.
+   *
+   * get updated data frame which carry analytics information:
+   * time differnce between two sessions, new intented session id and valid session flag
    *
    * @param inputDF
-   * @return
+   * @return analysis data frame
    */
   def getSessionAnalysisDF(inputDF: DataFrame): DataFrame = {
 
     val window = Window.partitionBy("e_visitor_id").orderBy("e_time")
     val lagTimeCol = lag(col("e_time"), 1).over(window)
 
-    val lastSessionTimeDifference = col("e_time").cast("long") - lagTimeCol.cast("long")
+    val lastSessionTimeDifference = when(lagTimeCol.isNull, null).otherwise(validate(col("e_time"), lagTimeCol))
 
-    val newSession =  (coalesce(lastSessionTimeDifference/60, lit(0)) > 30).cast("bigint")
+    val newSession =  (coalesce(lastSessionTimeDifference, lit(0)) >= 30).cast("bigint")
 
     val visitorSessionWindow = Window.partitionBy("e_visitor_id", "common_session").orderBy("e_time")
 
@@ -68,7 +87,7 @@ class SessionValidationJob(sessionValidationGlobalConfiguration: SessionValidati
     // we can directly just add indent_session field at it is only required condition to check
     val newDF = inputDF
       .withColumn("last_e_time", lagTimeCol)
-      .withColumn("session_time_diff",lastSessionTimeDifference/60)
+      .withColumn("session_time_diff",lastSessionTimeDifference)
       .withColumn("common_session", sum(newSession).over(window))
       .withColumn("intended_session_id", first("e_session_id").over(visitorSessionWindow))
       .withColumn("valid_session", when(col("intended_session_id")=== col("e_session_id"), true).otherwise(false))
@@ -76,28 +95,32 @@ class SessionValidationJob(sessionValidationGlobalConfiguration: SessionValidati
   }
 
 
+
   /** getUniqueAnomalyVisitor
+   * find all anomaly unique visitor which have wrong session created.
    *
    * @param analysisDF
-   * @return
+   * @return dataframe with visitor id
    */
   def getUniqueAnomalyVisitor(analysisDF: DataFrame): DataFrame = {
     analysisDF.filter(col("valid_session") === false).select("e_visitor_id").distinct()
   }
 
   /** getAnomalyExtraSession
+   * find all session which are not as per criterion least 30 minutes difference in any two sessions by any visitor.
    *
    * @param analysisDF
-   * @return
+   * @return dataframe with anomaly session details
    */
   def getAnomalyExtraSession(analysisDF: DataFrame): DataFrame = {
     analysisDF.filter(col("valid_session") === false).select("e_session_id", "e_visitor_id", "e_time").distinct()
   }
 
   /** getUpdatedSessionDFWithIntendedSessionId
+   * get new intended session id for given data
    *
    * @param analysisDF
-   * @return
+   * @return dataframe with intended session id
    */
   def getUpdatedSessionDFWithIntendedSessionId (analysisDF: DataFrame): DataFrame = {
     analysisDF.select("e_session_id", "e_visitor_id", "e_time", "intended_session_id")
